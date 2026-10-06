@@ -1,0 +1,268 @@
+mkdir -p ~/FINE_SHEET && cd ~/FINE_SHEET
+
+cat > requirements.txt << 'EOF'
+streamlit
+ultralytics
+opencv-python-headless
+easyocr
+numpy
+huggingface_hub
+EOF
+
+cat > download_models.py << 'EOF'
+"""Helmet + number plate models Hugging Face varun auto-download karto (helmet.pt, plate.pt)."""
+import os
+import shutil
+from huggingface_hub import hf_hub_download, list_repo_files
+
+MODELS = [
+    ("sharathhhhh/safetyHelmet-detection-yolov8", "helmet.pt", ["safetyHelmet.pt", "best.pt"]),
+    ("Koushim/yolov8-license-plate-detection", "plate.pt", ["best.pt"]),
+]
+
+
+def fetch(repo, target, preferred):
+    if os.path.exists(target):
+        print(f"[skip] {target} already ahe")
+        return True
+    try:
+        files = [f for f in list_repo_files(repo) if f.endswith(".pt")]
+        if not files:
+            print(f"[FAIL] {repo} madhe .pt file nahi")
+            return False
+        pick = next((p for p in preferred if p in files), files[0])
+        path = hf_hub_download(repo_id=repo, filename=pick)
+        shutil.copy(path, target)
+        print(f"[ok] {repo}/{pick} -> {target}")
+        return True
+    except Exception as e:
+        print(f"[FAIL] {repo}: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    ok = [fetch(*m) for m in MODELS]
+    from ultralytics import YOLO
+    for t in ("helmet.pt", "plate.pt"):
+        if os.path.exists(t):
+            print(t, "classes:", YOLO(t).names)
+    if not all(ok):
+        print("\nKahi model download nahi zala - tyasathi manually .pt file upload kara.")
+EOF
+
+cat > test_setup.py << 'EOF'
+"""Setup check: imports, models, ani dummy image var inference."""
+import os
+import numpy as np
+import cv2, streamlit, easyocr  # noqa: F401
+from ultralytics import YOLO
+
+print("cv2", cv2.__version__)
+img = np.zeros((480, 640, 3), np.uint8)
+
+for name in ("yolov8n.pt", "helmet.pt", "plate.pt"):
+    if os.path.exists(name):
+        m = YOLO(name)
+        m(img, verbose=False)
+        print(f"[ok] {name} loaded, classes: {list(m.names.values())[:8]}")
+    else:
+        print(f"[MISSING] {name}")
+
+easyocr.Reader(["en"], gpu=False)
+print("[ok] easyocr ready")
+print("TEST PASS")
+EOF
+
+cat > setup.sh << 'EOF'
+#!/usr/bin/env bash
+set -e
+echo "== 1/4 System libs =="
+sudo apt-get update -y && sudo apt-get install -y libgl1 libglib2.0-0 ffmpeg
+echo "== 2/4 Python packages =="
+pip install --upgrade pip
+pip uninstall -y opencv-python 2>/dev/null || true
+pip install -r requirements.txt
+pip install --force-reinstall --no-deps opencv-python-headless
+echo "== 3/4 Models download =="
+python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+python download_models.py
+echo "== 4/4 Smoke test =="
+python test_setup.py
+echo "Sagla ready."
+EOF
+
+cat > app.py << 'EOF'
+"""
+Traffic Violation Detector - Step 1 MVP
+Run:  streamlit run app.py
+Detects: persons, bikes, riders per bike (triple seat), helmet / no helmet, number plate (OCR)
+"""
+import os, re, tempfile
+import cv2
+import numpy as np
+import streamlit as st
+from ultralytics import YOLO
+
+HELMET_MODEL = "helmet.pt"
+PLATE_MODEL = "plate.pt"
+PLATE_REGEX = re.compile(r"[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}")  # e.g. MH12AB1234
+
+st.set_page_config(page_title="Traffic Violation Detector", layout="wide")
+st.title("Traffic Violation Detector - MVP")
+
+
+@st.cache_resource
+def load_models():
+    base = YOLO("yolov8n.pt")  # COCO: person, motorcycle, car...
+    helmet = YOLO(HELMET_MODEL) if os.path.exists(HELMET_MODEL) else None
+    plate = YOLO(PLATE_MODEL) if os.path.exists(PLATE_MODEL) else None
+    import easyocr
+    reader = easyocr.Reader(["en"], gpu=False)
+    return base, helmet, plate, reader
+
+
+base, helmet_m, plate_m, reader = load_models()
+if helmet_m is None:
+    st.warning("helmet.pt sapadla nahi - helmet detection band ahe. Fakt person/bike count chalel.")
+if plate_m is None:
+    st.info("plate.pt nahi - bike crop var direct OCR try karel (kami accurate).")
+
+
+def read_plate(img):
+    if img.size == 0:
+        return None
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    best = None
+    for _, text, conf in reader.readtext(g):
+        t = re.sub(r"[^A-Z0-9]", "", text.upper())
+        if PLATE_REGEX.search(t):
+            return PLATE_REGEX.search(t).group()
+        if len(t) >= 6 and conf > 0.4:
+            best = t
+    return best
+
+
+def inside(pt, box):
+    return box[0] <= pt[0] <= box[2] and box[1] <= pt[1] <= box[3]
+
+
+def analyze(frame, conf=0.35):
+    out = frame.copy()
+    res = base(frame, conf=conf, verbose=False)[0]
+    persons, bikes = [], []
+    for b in res.boxes:
+        cls = int(b.cls[0])
+        xyxy = list(map(int, b.xyxy[0]))
+        if cls == 0:
+            persons.append(xyxy)
+        elif cls == 3:  # motorcycle
+            bikes.append(xyxy)
+
+    helmets = []  # (box, has_helmet)
+    if helmet_m is not None:
+        hr = helmet_m(frame, conf=0.35, verbose=False)[0]
+        for b in hr.boxes:
+            name = helmet_m.names[int(b.cls[0])].lower()
+            bad = ("no" in name) or ("without" in name)
+            helmets.append((list(map(int, b.xyxy[0])), not bad))
+
+    report = []
+    for i, bk in enumerate(bikes):
+        x1, y1, x2, y2 = bk
+        w, h = x2 - x1, y2 - y1
+        zone = [x1 - w * 0.15, y1 - h * 1.2, x2 + w * 0.15, y2]
+        riders = [p for p in persons if inside(((p[0] + p[2]) // 2, (p[1] + p[3]) // 2), zone)]
+        n = len(riders)
+
+        no_helmet = 0
+        for p in riders:
+            head = [p[0], p[1], p[2], p[1] + (p[3] - p[1]) * 0.35]
+            for hb, ok in helmets:
+                c = ((hb[0] + hb[2]) // 2, (hb[1] + hb[3]) // 2)
+                if inside(c, head):
+                    if not ok:
+                        no_helmet += 1
+                    break
+
+        plate_txt = None
+        if plate_m is not None:
+            pr = plate_m(frame[max(y1, 0):y2, max(x1, 0):x2], conf=0.3, verbose=False)[0]
+            if len(pr.boxes):
+                px1, py1, px2, py2 = map(int, pr.boxes[0].xyxy[0])
+                crop = frame[max(y1, 0):y2, max(x1, 0):x2][py1:py2, px1:px2]
+                plate_txt = read_plate(crop)
+        else:
+            plate_txt = read_plate(frame[max(y1, 0):y2, max(x1, 0):x2][int(h * 0.5):, :])
+
+        violations = []
+        if n >= 3:
+            violations.append("TRIPLE SEAT")
+        if no_helmet:
+            violations.append(f"NO HELMET x{no_helmet}")
+        color = (0, 0, 255) if violations else (0, 200, 0)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        label = f"Bike{i+1} riders:{n} plate:{plate_txt or '-'} " + " ".join(violations)
+        cv2.putText(out, label, (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        report.append(dict(bike=i + 1, riders=n, no_helmet=no_helmet, plate=plate_txt, violations=violations))
+
+    for p in persons:
+        cv2.rectangle(out, (p[0], p[1]), (p[2], p[3]), (255, 160, 0), 1)
+    return out, len(persons), report
+
+
+mode = st.radio("Input", ["Image", "Video", "Webcam (live)"], horizontal=True)
+
+if mode == "Image":
+    f = st.file_uploader("Image upload kara", type=["jpg", "jpeg", "png"])
+    if f:
+        img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), 1)
+        out, npers, rep = analyze(img)
+        st.image(out[:, :, ::-1], use_container_width=True)
+        st.metric("Total persons", npers)
+        st.json(rep)
+
+elif mode == "Video":
+    f = st.file_uploader("Video upload kara", type=["mp4", "avi", "mov"])
+    skip = st.slider("Process every Nth frame", 1, 10, 3)
+    if f and st.button("Start"):
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(f.read()); tmp.close()
+        cap = cv2.VideoCapture(tmp.name)
+        ph, info = st.empty(), st.empty()
+        seen, k = {}, 0
+        os.makedirs("evidence", exist_ok=True)
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                break
+            k += 1
+            if k % skip:
+                continue
+            out, npers, rep = analyze(frame)
+            ph.image(out[:, :, ::-1], use_container_width=True)
+            for r in rep:
+                if r["violations"]:
+                    cv2.imwrite(f"evidence/frame{k}_bike{r['bike']}.jpg", out)
+                    seen[f"{k}-{r['bike']}"] = r
+            info.write(f"Frame {k} | persons: {npers} | violations saved: {len(seen)}")
+        cap.release()
+        st.success("Done. Evidence 'evidence/' folder madhe save zala.")
+        st.json(list(seen.values()))
+
+else:
+    run = st.checkbox("Start webcam")
+    ph = st.empty()
+    if run:
+        cap = cv2.VideoCapture(0)  # RTSP URL pan chalel: cv2.VideoCapture("rtsp://...")
+        while run:
+            ok, frame = cap.read()
+            if not ok:
+                st.error("Camera open nahi zala")
+                break
+            out, npers, rep = analyze(frame)
+            ph.image(out[:, :, ::-1], use_container_width=True)
+        cap.release()
+EOF
+
+bash setup.sh && streamlit run app.py --server.port 8501
