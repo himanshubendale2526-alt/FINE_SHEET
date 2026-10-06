@@ -1,0 +1,318 @@
+cd ~/FINE_SHEET
+
+cat > app.py << 'EOF'
+"""
+Traffic Violation Detector - Step 1.1
+Run:  streamlit run app.py
+Detects: persons, bikes, riders per bike (head-count based, works from behind),
+helmet / no helmet, number plate TEXT (OCR) shown on image + saved in evidence/violations.csv
+"""
+import os, re, csv, tempfile, datetime
+import cv2
+import numpy as np
+import streamlit as st
+from ultralytics import YOLO
+
+HELMET_MODEL = "helmet.pt"
+PLATE_MODEL = "plate.pt"
+PLATE_REGEX = re.compile(r"[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}")  # e.g. MH12AB1234
+BAD_NAME = re.compile(r"(^|[^a-z])(no|without)([^a-z]|$)")      # "no helmet", "no_helmet", "without helmet"
+ALLOW = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+EVID = "evidence"
+LOG = os.path.join(EVID, "violations.csv")
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+st.set_page_config(page_title="Traffic Violation Detector", layout="wide")
+st.title("Traffic Violation Detector - MVP")
+
+# ---------------- sidebar settings ----------------
+st.sidebar.header("Settings")
+base_name = st.sidebar.selectbox("Person/bike model", ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"], index=1,
+                                 help="Motha model = jast accurate pan slow")
+imgsz = st.sidebar.select_slider("Image size", options=[640, 800, 960, 1280], value=960)
+conf_main = st.sidebar.slider("Person/bike confidence", 0.10, 0.80, 0.30, 0.05)
+conf_head = st.sidebar.slider("Head/helmet confidence", 0.10, 0.80, 0.25, 0.05)
+triple_at = st.sidebar.number_input("Triple seat = riders >=", 2, 5, 3)
+
+
+@st.cache_resource
+def load_models(base_file):
+    base = YOLO(base_file)
+    helmet = YOLO(HELMET_MODEL) if os.path.exists(HELMET_MODEL) else None
+    plate = YOLO(PLATE_MODEL) if os.path.exists(PLATE_MODEL) else None
+    import easyocr
+    reader = easyocr.Reader(["en"], gpu=False)
+    return base, helmet, plate, reader
+
+
+base, helmet_m, plate_m, reader = load_models(base_name)
+if helmet_m is None:
+    st.warning("helmet.pt sapadla nahi - helmet/head detection band ahe. Triple seat sathi pan head model lagto.")
+if plate_m is None:
+    st.info("plate.pt nahi - bike crop chya khalchya bhagavar OCR try karel (kami accurate).")
+
+
+# ---------------- helpers ----------------
+def center(b):
+    return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+
+
+def inside(pt, box):
+    return box[0] <= pt[0] <= box[2] and box[1] <= pt[1] <= box[3]
+
+
+def assign_items(items, bikes, getbox=lambda t: t):
+    """Pratyek person/head fakt EK bike la deto (javalchya bike chya centre nusar).
+    Mhanje bajulchya gadi che lok dusrya gadi madhe mojle jaat nahit."""
+    res = {i: [] for i in range(len(bikes))}
+    for it in items:
+        cx, cy = center(getbox(it))
+        best, best_d = None, 1e9
+        for i, (x1, y1, x2, y2) in enumerate(bikes):
+            w, h = x2 - x1, y2 - y1
+            zone = (x1 - w * 0.10, y1 - h * 1.3, x2 + w * 0.10, y2)
+            if inside((cx, cy), zone):
+                d = abs(cx - (x1 + x2) / 2) / max(w, 1)
+                if d < best_d:
+                    best, best_d = i, d
+        if best is not None:
+            res[best].append(it)
+    return res
+
+
+def dedupe_heads(heads):
+    """heads = [(box, ok, conf)]; javal-javal che duplicate heads kadhto."""
+    kept = []
+    for hd in sorted(heads, key=lambda t: -t[2]):
+        c = center(hd[0])
+        w = max(hd[0][2] - hd[0][0], 1)
+        if all(np.hypot(c[0] - center(k[0])[0], c[1] - center(k[0])[1]) > 0.5 * w for k in kept):
+            kept.append(hd)
+    return kept
+
+
+def is_bad_head(name):
+    name = name.lower().strip()
+    return bool(BAD_NAME.search(name)) or name in ("head", "bare head", "bare_head")
+
+
+def read_plate(img):
+    if img is None or img.size == 0:
+        return None
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    scale = int(min(6, max(2, 220 // max(g.shape[1], 1))))
+    g = cv2.resize(g, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+    res = reader.readtext(g, allowlist=ALLOW)
+    if not res:
+        return None
+    half = max(g.shape[0] / 2, 1)
+    # 2-line plates: varchi line aadhi, mag left-to-right
+    res.sort(key=lambda r: (int(((r[0][0][1] + r[0][2][1]) / 2) // half), r[0][0][0]))
+    toks = [(re.sub(r"[^A-Z0-9]", "", t.upper()), c) for _, t, c in res]
+    joined = "".join(t for t, _ in toks)
+    m = PLATE_REGEX.search(joined)
+    if m:
+        return m.group()
+    good = [t for t, c in toks if len(t) >= 6 and c > 0.4]
+    if good:
+        return max(good, key=len)
+    return joined if len(joined) >= 6 else None
+
+
+def draw_label(img, lines, x, y, color):
+    """Text background sobat, bike chya varti (khalun varti) lines."""
+    y_cur = y
+    for text in reversed(lines):
+        (tw, th), bl = cv2.getTextSize(text, FONT, 0.6, 2)
+        top = max(y_cur - th - bl - 4, 0)
+        cv2.rectangle(img, (x, top), (x + tw + 6, top + th + bl + 4), color, -1)
+        cv2.putText(img, text, (x + 3, top + th + 2), FONT, 0.6, (255, 255, 255), 2)
+        y_cur = top
+
+
+# ---------------- core ----------------
+def analyze(frame):
+    out = frame.copy()
+    H, W = frame.shape[:2]
+    res = base(frame, conf=conf_main, imgsz=imgsz, verbose=False)[0]
+    persons, bikes = [], []
+    for b in res.boxes:
+        cls = int(b.cls[0])
+        xyxy = list(map(int, b.xyxy[0]))
+        if cls == 0:
+            persons.append(xyxy)
+        elif cls == 3:  # motorcycle
+            bikes.append(xyxy)
+
+    heads = []  # (box, helmet_ok, conf)
+    if helmet_m is not None:
+        hr = helmet_m(frame, conf=conf_head, imgsz=imgsz, verbose=False)[0]
+        for b in hr.boxes:
+            name = helmet_m.names[int(b.cls[0])]
+            heads.append((list(map(int, b.xyxy[0])), not is_bad_head(name), float(b.conf[0])))
+        heads = dedupe_heads(heads)
+
+    p_by_bike = assign_items(persons, bikes)
+    h_by_bike = assign_items(heads, bikes, getbox=lambda t: t[0])
+
+    report, crops = [], []
+    for i, bk in enumerate(bikes):
+        x1, y1, x2, y2 = bk
+        w, h = x2 - x1, y2 - y1
+        n_person = len(p_by_bike[i])
+        my_heads = h_by_bike[i]
+        n_head = len(my_heads)
+        n = max(n_person, n_head)  # maghun overlap zalyavar person 1 disto pan heads 3 distat
+        no_helmet = sum(1 for _, ok, _ in my_heads if not ok)
+
+        # ---- number plate ----
+        ox, oy = max(int(x1 - w * 0.10), 0), max(y1, 0)
+        ex, ey = min(int(x2 + w * 0.10), W), min(int(y2 + h * 0.15), H)
+        bike_crop = frame[oy:ey, ox:ex]
+        plate_txt, plate_box, plate_crop = None, None, None
+        if plate_m is not None and bike_crop.size:
+            pr = plate_m(bike_crop, conf=0.25, imgsz=640, verbose=False)[0]
+            if len(pr.boxes):
+                k = int(np.argmax([float(b.conf[0]) for b in pr.boxes]))
+                px1, py1, px2, py2 = map(int, pr.boxes[k].xyxy[0])
+                pad = 4
+                px1, py1 = max(px1 - pad, 0), max(py1 - pad, 0)
+                px2, py2 = px2 + pad, py2 + pad
+                plate_crop = bike_crop[py1:py2, px1:px2]
+                plate_box = (ox + px1, oy + py1, ox + px2, oy + py2)
+                plate_txt = read_plate(plate_crop)
+        if plate_txt is None and bike_crop.size:
+            low = bike_crop[int(bike_crop.shape[0] * 0.5):, :]
+            plate_txt = read_plate(low)
+            if plate_crop is None:
+                plate_crop = low
+
+        violations = []
+        if n >= triple_at:
+            violations.append(f"TRIPLE SEAT ({n})")
+        if no_helmet:
+            violations.append(f"NO HELMET x{no_helmet}")
+        color = (0, 0, 255) if violations else (0, 160, 0)
+
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        if plate_box:
+            cv2.rectangle(out, plate_box[:2], plate_box[2:], (0, 215, 255), 2)
+        lines = [f"Bike{i+1}  riders:{n}  (persons:{n_person} heads:{n_head})",
+                 f"PLATE: {plate_txt or 'not readable'}"]
+        if violations:
+            lines.append(" | ".join(violations))
+        draw_label(out, lines, x1, y1 - 2 if y1 > 70 else min(y2 + 70, H - 5), color)
+
+        report.append(dict(bike=i + 1, riders=n, persons=n_person, heads=n_head, no_helmet=no_helmet,
+                           plate=plate_txt, violations=violations))
+        crops.append(plate_crop)
+
+    for p in persons:
+        cv2.rectangle(out, (p[0], p[1]), (p[2], p[3]), (255, 160, 0), 1)
+    for hb, ok, _ in heads:
+        cv2.rectangle(out, (hb[0], hb[1]), (hb[2], hb[3]), (0, 200, 0) if ok else (0, 0, 255), 2)
+    return out, len(persons), report, crops
+
+
+def save_violation(out, crop, rec, frame_no):
+    os.makedirs(EVID, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = f"{ts}_f{frame_no}_bike{rec['bike']}_{rec['plate'] or 'NOPLATE'}"
+    img_path = os.path.join(EVID, tag + ".jpg")
+    cv2.imwrite(img_path, out)
+    crop_path = ""
+    if crop is not None and crop.size:
+        crop_path = os.path.join(EVID, tag + "_plate.jpg")
+        cv2.imwrite(crop_path, crop)
+    new = not os.path.exists(LOG)
+    with open(LOG, "a", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        if new:
+            wr.writerow(["time", "frame", "bike", "plate", "riders", "no_helmet", "violations", "image", "plate_image"])
+        wr.writerow([datetime.datetime.now().isoformat(timespec="seconds"), frame_no, rec["bike"],
+                     rec["plate"] or "", rec["riders"], rec["no_helmet"], "; ".join(rec["violations"]),
+                     img_path, crop_path])
+    return img_path
+
+
+# ---------------- UI ----------------
+mode = st.radio("Input", ["Image", "Video", "Webcam (live)"], horizontal=True)
+
+if mode == "Image":
+    f = st.file_uploader("Image upload kara", type=["jpg", "jpeg", "png"])
+    if f:
+        img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), 1)
+        out, npers, rep, crops = analyze(img)
+        st.image(out[:, :, ::-1], use_container_width=True)
+        st.metric("Total persons", npers)
+        for r, c in zip(rep, crops):
+            if r["violations"]:
+                save_violation(out, c, r, 0)
+        if rep:
+            st.subheader("Bikes / Number plates")
+            st.dataframe(rep, use_container_width=True)
+            cols = st.columns(min(len(rep), 4))
+            for j, (r, c) in enumerate(zip(rep, crops)):
+                with cols[j % len(cols)]:
+                    st.markdown(f"**Bike {r['bike']}: `{r['plate'] or 'not readable'}`**")
+                    if c is not None and c.size:
+                        st.image(c[:, :, ::-1], use_container_width=True)
+        else:
+            st.info("Konti bike sapadli nahi.")
+
+elif mode == "Video":
+    f = st.file_uploader("Video upload kara", type=["mp4", "avi", "mov"])
+    skip = st.slider("Process every Nth frame", 1, 10, 3)
+    if f and st.button("Start"):
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(f.read()); tmp.close()
+        cap = cv2.VideoCapture(tmp.name)
+        ph, info, plate_box = st.empty(), st.empty(), st.empty()
+        results, seen_plates, last_unknown, k = [], set(), -999, 0
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                break
+            k += 1
+            if k % skip:
+                continue
+            out, npers, rep, crops = analyze(frame)
+            ph.image(out[:, :, ::-1], use_container_width=True)
+            for r, c in zip(rep, crops):
+                if not r["violations"]:
+                    continue
+                if r["plate"]:
+                    if r["plate"] in seen_plates:   # same gadi parat parat save nako
+                        continue
+                    seen_plates.add(r["plate"])
+                else:
+                    if k - last_unknown < 30:        # plate nasel tar kahi frames cooldown
+                        continue
+                    last_unknown = k
+                r["frame"] = k
+                r["image"] = save_violation(out, c, r, k)
+                results.append(r)
+            info.write(f"Frame {k} | persons: {npers} | violations saved: {len(results)}")
+            if results:
+                plate_box.dataframe(results, use_container_width=True)
+        cap.release()
+        st.success(f"Done. Evidence '{EVID}/' madhe save zala, log: {LOG}")
+        st.dataframe(results, use_container_width=True)
+
+else:
+    run = st.checkbox("Start webcam")
+    ph = st.empty()
+    if run:
+        cap = cv2.VideoCapture(0)  # RTSP URL pan chalel: cv2.VideoCapture("rtsp://...")
+        while run:
+            ok, frame = cap.read()
+            if not ok:
+                st.error("Camera open nahi zala")
+                break
+            out, npers, rep, crops = analyze(frame)
+            ph.image(out[:, :, ::-1], use_container_width=True)
+        cap.release()
+EOF
+
+streamlit run app.py --server.port 8501
